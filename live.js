@@ -120,12 +120,12 @@ function createLive({ privateKey, address, cfg, log, viemLib }) {
   const { privateKeyToAccount } = viemLib ? viemLib.accounts : require('viem/accounts');
   const { base } = viemLib ? viemLib.chains : require('viem/chains');
   const account = privateKeyToAccount(privateKey);
-  if (account.address.toLowerCase() !== address.toLowerCase()) throw new Error('wallet.json address does not match its private key');
+  if (account.address.toLowerCase() !== address.toLowerCase()) throw new Error('wallet address does not match its private key');
   const pub = createPublicClient({ chain: base, transport: http(cfg.rpc) });
   const wal = createWalletClient({ account, chain: base, transport: http(cfg.rpc) });
   const ok = {}; // sym -> { decimals }
   let fails = 0;
-  const stopFile = path.join(__dirname, 'STOP');
+  const stopFile = cfg.stopFile || path.join(__dirname, 'STOP'); // must be the same file the dashboard kill switch writes
 
   const bal = (addr) => pub.readContract({ address: addr, abi: ERC20, functionName: 'balanceOf', args: [account.address] });
 
@@ -164,7 +164,7 @@ function createLive({ privateKey, address, cfg, log, viemLib }) {
     // One-time bounded approval to the verified Delta contract (needs a little ETH; reused for several trades).
     const have = await pub.readContract({ address: getAddress(sellToken), abi: ERC20, functionName: 'allowance', args: [account.address, getAddress(DELTA)] });
     if (have < sellAmount) {
-      let amt = sellAmount * BigInt(cfg.approvalTrades);
+      let amt = same(sellToken, USDC) ? sellAmount * BigInt(cfg.approvalTrades) : sellAmount; // multi-trade allowance only for USDC; other tokens get the exact amount
       if (same(sellToken, USDC)) { const cap = BigInt(Math.floor(cfg.maxTotalUsd * 1e6)); if (amt > cap) amt = cap; }
       if (amt < sellAmount) amt = sellAmount;
       const h = await wal.writeContract({ address: getAddress(sellToken), abi: ERC20, functionName: 'approve', args: [getAddress(DELTA), amt] });

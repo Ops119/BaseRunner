@@ -83,3 +83,10 @@ Every token must pass all of these, and anything unknown counts as a fail:
 The paper sleeve has a $30 budget, $10 per position, 3 positions at most. Fills are pessimistic (price impact, 3% extra buy slippage, 5% extra sell slippage, 1% pool fee). Exits: stop -30%, take-profit +100%, trailing stop, 12 h time stop, or immediately if liquidity falls by half. It halts itself if it loses half its budget and won't re-enter a token for 24 h after selling it.
 
 Limits: GeckoTerminal only lists the newest pools, so fast launches can be missed, and free-tier data can lag or rate-limit (the scanner backs off for 5 minutes). Tune with `SCAN_MAX_MC`, `SCAN_MIN_LIQ`, `SCAN_BUDGET_USD`, `SCAN_TRADE_USD`, or turn it off with `SCAN=off`.
+
+## Security notes
+- Dashboard: `DASH_TOKEN` (16+ characters) is required whenever the agent listens on a public address. Wrong tokens are locked out after 10 tries per 5 minutes, the login cookie stores a hash rather than the token, and responses carry a strict CSP and anti-framing headers. The `?token=` link puts the token in the URL once, so open it only on devices you trust and don't share screenshots of the address bar.
+- The kill switch (`STOP` file) lives in `STATE_DIR`, the same place the live executor checks.
+- Private key: prefer the `AGENT_PRIVATE_KEY` variable. Anyone with access to your Railway project can read it, so fund the wallet with only what you can lose.
+- Dependencies: only `viem` (live mode). Run `npm install` once and commit the generated `package-lock.json` so deploys stay pinned.
+- Report problems via GitHub issues; never post keys or logs containing addresses you want private.

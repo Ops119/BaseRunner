@@ -37,7 +37,7 @@ function parsePools(json) {
     const bid = rel.base_token?.data?.id || '', qid = rel.quote_token?.data?.id || '';
     return {
       pool: lc(a.address), name: a.name, created: Date.parse(a.pool_created_at),
-      base: lc(tok[bid]?.address || bid.split('_')[1]), sym: tok[bid]?.symbol || (a.name || '').split(' / ')[0],
+      base: lc(tok[bid]?.address || bid.split('_')[1]), sym: String(tok[bid]?.symbol || (a.name || '').split(' / ')[0] || '?').replace(/[^\x20-\x7e]/g, '').slice(0, 20),
       quote: lc(tok[qid]?.address || qid.split('_')[1]), dex: rel.dex?.data?.id || '',
       mc: num(a.market_cap_usd), fdv: num(a.fdv_usd), liq: num(a.reserve_in_usd), price: num(a.base_token_price_usd),
       vol24: num(a.volume_usd?.h24), ch1h: num(a.price_change_percentage?.h1), ch24: num(a.price_change_percentage?.h24),
@@ -233,14 +233,14 @@ function createScanner({ dir, log, fetchFn = (...a) => fetch(...a), now = () => 
         let warn = [];
         if (!why.length) {
           // market screen passed: now the contract screen (cached 1h, capped per scan)
-          let sec = meta.sec && now() - meta.secAt < 3600e3 ? meta.sec : undefined;
-          if (sec === undefined && secCalls < 8) {
-            try { sec = await securityOf(p.base); meta.sec = sec; meta.secAt = now(); secCalls++; await sleep(400); }
-            catch (e) { why = ['security check unavailable: ' + e.message]; sec = undefined; }
+          let res = meta.secRes && now() - meta.secAt < 3600e3 ? meta.secRes : undefined;   // cache only the verdict, not the raw GoPlus blob
+          if (res === undefined && secCalls < 8) {
+            try { const sec = await securityOf(p.base); res = screenSecurity(sec, p, cfg); meta.secRes = res; meta.secAt = now(); secCalls++; await sleep(400); }
+            catch (e) { why = ['security check unavailable: ' + e.message]; res = undefined; }
           }
           if (!why.length) {
-            if (sec === undefined) why = ['security check queued'];
-            else { const r = screenSecurity(sec, p, cfg); why = r.why; warn = r.warn; if (why.length) st.rejected[p.base] = { t: now(), hard: true, why }; }
+            if (res === undefined) why = ['security check queued'];
+            else { why = res.why; warn = res.warn; if (why.length) st.rejected[p.base] = { t: now(), hard: true, why }; }
           }
         }
         const mc = p.mc ?? p.fdv;

@@ -1,3 +1,16 @@
-{ "name": "base-agent", "version": "2.0.0", "private": true,
-  "scripts": { "start": "node agent.js", "wallet": "node wallet.js" },
-  "dependencies": { "viem": "^2.0.0" } }
+{
+  "name": "baserunner",
+  "version": "2.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node agent.js",
+    "wallet": "node wallet.js"
+  },
+  "dependencies": {
+    "viem": "^2.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED"
+}

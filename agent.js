@@ -13,9 +13,9 @@ let L = null; // live executor, set in startup() when LIVE=1
 const DATA_DIR = process.env.STATE_DIR || __dirname; // on Railway: the mounted volume (e.g. /data)
 fs.mkdirSync(DATA_DIR, { recursive: true });
 const STOP_FILE = path.join(DATA_DIR, 'STOP');
-const PUBLIC = !!process.env.PORT || process.env.HOST === '0.0.0.0'; // Railway injects PORT
 const HOST = process.env.HOST || (process.env.PORT ? '0.0.0.0' : '127.0.0.1');
 const DASH_TOKEN = process.env.DASH_TOKEN || '';
+if (DASH_TOKEN && DASH_TOKEN.length < 16) { console.error('\nREFUSED TO START: DASH_TOKEN must be at least 16 characters (use a long random string).\n'); process.exit(1); }
 
 const CFG = {
   port: +process.env.PORT || 8402,
@@ -138,7 +138,7 @@ async function fetchChain() {
 
 // ---------- strategy ----------
 function signal(d) {
-  if (d.c1h == null || d.c24h == null || d.c7d == null) return null;
+  if (!d || d.c1h == null || d.c24h == null || d.c7d == null) return null;
   if (d.c1h > 0.3 && d.c24h > 2 && d.c7d > -10) return { type: 'MOMENTUM', score: d.c24h / 10 + d.c1h };
   if (d.c7d <= -12 && d.c1h > 0.5 && d.c24h > -3) return { type: 'DIP BOUNCE', score: -d.c7d / 20 + d.c1h };
   return null;
@@ -160,6 +160,7 @@ async function sell(sym, why) {
   S.trades.unshift({ t: now(), sym, side: 'SELL', px, qty, usd: net, pnl, why, hash, via });
   S.cooldown[sym] = now() + CFG.cooldownHours * 3600e3;
   delete S.positions[sym];
+  save();
   log(`${LIVE_ON ? 'LIVE ' : ''}SELL ${sym} @ ${px.toPrecision(5)} (${why}) P&L ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}${hash ? ` via ${via} ${hash.slice(0, 12)}…` : ''}`, pnl >= 0 ? 'win' : 'loss');
 }
 async function buy(sym, usd, sig) {
@@ -175,6 +176,7 @@ async function buy(sym, usd, sig) {
   S.cash -= usd;
   S.positions[sym] = { qty, entry: px, cost: usd, peak: px, openedAt: now(), sig: sig.type };
   S.trades.unshift({ t: now(), sym, side: 'BUY', px, qty, usd, why: sig.type, hash });
+  save();
   log(`${LIVE_ON ? 'LIVE ' : ''}BUY ${sym} $${usd.toFixed(2)} @ ${px.toPrecision(5)} (${sig.type}, score ${sig.score.toFixed(2)})${hash ? ` via ${via} ${hash.slice(0, 12)}…` : ''}`, 'buy');
 }
 
@@ -182,7 +184,9 @@ async function decide() {
   if (S.dayKey !== utcDay()) { S.dayKey = utcDay(); S.dayStart = equity(); S.halted = false; log('New UTC day: daily loss counter reset'); }
   // exits first
   for (const [sym, p] of Object.entries(S.positions)) {
-    const px = live.prices[sym].price; p.peak = Math.max(p.peak, px);
+    const px = live.prices[sym]?.price;
+    if (!(px > 0)) { if (!p._noPx) { log(`No price for held ${sym} this tick: exit checks skipped for it.`, 'risk'); p._noPx = true; } continue; }
+    p._noPx = false; p.peak = Math.max(p.peak, px);
     const ret = px / p.entry - 1, fromPeak = px / p.peak - 1, age = (now() - p.openedAt) / 3600e3;
     if (ret <= CFG.stopLoss) await sell(sym, 'stop-loss');
     else if (ret >= CFG.takeProfit) await sell(sym, 'take-profit');
@@ -200,7 +204,7 @@ async function decide() {
   await updateRegime();
   if (CFG.regimeDays && regime.ok !== true) return; // downtrend (or unknown): stay in cash
   const cands = WATCHLIST.filter(w => !S.positions[w.sym] && !(S.cooldown[w.sym] > now()) && (!LIVE_ON || L.tradable(w.sym)))
-    .map(w => ({ sym: w.sym, sig: signal(live.prices[w.sym]) })).filter(c => c.sig).sort((a, b) => b.sig.score - a.sig.score);
+    .filter(w => live.prices[w.sym]?.price > 0).map(w => ({ sym: w.sym, sig: signal(live.prices[w.sym]) })).filter(c => c.sig).sort((a, b) => b.sig.score - a.sig.score);
   if (!cands.length) return;
   const best = cands[0], room = S.cash - eq * CFG.cashReserve;
   let size = Math.min(eq * CFG.maxPositionPct, room);
@@ -245,30 +249,51 @@ function apiState() {
 }
 
 const crypto = require('crypto');
-const safeEq = (x, y) => { const A = crypto.createHash('sha256').update(String(x)).digest(), B = crypto.createHash('sha256').update(String(y)).digest(); return crypto.timingSafeEqual(A, B); };
+const sha = (x) => crypto.createHash('sha256').update(String(x)).digest();
+const safeEq = (x, y) => crypto.timingSafeEqual(sha(x), sha(y));
+const COOKIE_VAL = DASH_TOKEN ? sha(DASH_TOKEN).toString('hex') : ''; // the cookie holds a hash, never the token itself
 const cookieOf = (req, k) => ((req.headers.cookie || '').split(';').map(s => s.trim().split('=')).find(p => p[0] === k) || [])[1] || '';
+const SEC_HEADERS = {
+  'x-content-type-options': 'nosniff', 'x-frame-options': 'DENY', 'referrer-policy': 'no-referrer', 'cache-control': 'no-store',
+  'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+};
+// Brute-force guard: 10 wrong tokens per 5 minutes per client, then 429. Behind Railway's proxy the client is the last X-Forwarded-For entry.
+const fails = new Map();
+const clientIp = (req) => String(req.headers['x-forwarded-for'] || '').split(',').pop().trim() || req.socket.remoteAddress || '?';
+const blocked = (ip) => { const f = fails.get(ip); return !!f && f.n >= 10 && now() - f.t < 300e3; };
+const noteFail = (ip) => { const f = fails.get(ip); if (!f || now() - f.t >= 300e3) fails.set(ip, { n: 1, t: now() }); else f.n++; if (fails.size > 1000) fails.clear(); };
 let lastTickOk = 0, shuttingDown = false;
-const server = http.createServer((req, res) => {
+function handle(req, res) {
+  for (const [k, v] of Object.entries(SEC_HEADERS)) res.setHeader(k, v);
   if (req.url === '/health') { // unauthenticated, reveals nothing sensitive; used by Railway healthcheck
     const age = lastTickOk ? Math.round((now() - lastTickOk) / 1000) : null;
     res.writeHead(shuttingDown ? 503 : 200, { 'content-type': 'application/json' });
     return res.end(JSON.stringify({ ok: !shuttingDown, mode: CFG.mode, lastTickAgeSec: age }));
   }
-  if (DASH_TOKEN) { // everything else needs the token (header, cookie, or one-time ?token= which sets a cookie)
+  if (DASH_TOKEN) { // everything else needs the token (Bearer header, cookie, or one-time ?token= which sets a cookie)
+    const ip = clientIp(req);
+    if (blocked(ip)) { res.writeHead(429, { 'content-type': 'text/plain', 'retry-after': '300' }); return res.end('too many attempts'); }
     const u = new URL(req.url, 'http://x'), q = u.searchParams.get('token');
     let ck = ''; try { ck = decodeURIComponent(cookieOf(req, 'agent_auth')); } catch (e) {}
-    const given = (req.headers.authorization || '').replace(/^Bearer /, '') || ck || q || '';
-    if (!given || !safeEq(given, DASH_TOKEN)) { res.writeHead(401, { 'content-type': 'text/plain' }); return res.end('unauthorized: open the dashboard once with ?token=YOUR_DASH_TOKEN'); }
+    const bearer = (req.headers.authorization || '').replace(/^Bearer /, '');
+    const okAuth = (bearer && safeEq(bearer, DASH_TOKEN)) || (q && safeEq(q, DASH_TOKEN)) || (ck && safeEq(ck, COOKIE_VAL));
+    if (!okAuth) { noteFail(ip); res.writeHead(401, { 'content-type': 'text/plain' }); return res.end('unauthorized: open the dashboard once with ?token=YOUR_DASH_TOKEN'); }
     if (q && req.method === 'GET' && !u.pathname.startsWith('/api/')) {
-      res.writeHead(302, { 'set-cookie': `agent_auth=${encodeURIComponent(DASH_TOKEN)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=2592000`, location: u.pathname }); return res.end();
+      const secure = req.headers['x-forwarded-proto'] === 'https' ? ' Secure;' : ''; // plain-http localhost still works
+      res.writeHead(302, { 'set-cookie': `agent_auth=${COOKIE_VAL}; HttpOnly;${secure} SameSite=Strict; Path=/; Max-Age=2592000`, location: u.pathname }); return res.end();
     }
   }
   if (req.method === 'POST' && req.headers['x-agent'] !== '1') { res.writeHead(403); return res.end('forbidden'); }
   if (req.method === 'POST' && req.url === '/api/stop') { fs.writeFileSync(STOP_FILE, 'stopped from dashboard ' + new Date().toISOString()); log('Kill switch pressed: no new entries.', 'risk'); res.writeHead(200); return res.end('ok'); }
   if (req.method === 'POST' && req.url === '/api/resume') { try { fs.unlinkSync(STOP_FILE); } catch (e) {} log('Kill switch cleared.'); res.writeHead(200); return res.end('ok'); }
-  if (req.url.startsWith('/api/state')) { res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }); return res.end(JSON.stringify(apiState())); }
+  if (req.url.startsWith('/api/state')) { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify(apiState())); }
   fs.readFile(path.join(__dirname, 'public', 'index.html'), (e, buf) => { if (e) { res.writeHead(404); return res.end('not found'); } res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(buf); });
+}
+// A throw inside a request handler must never take the trading process down.
+const server = http.createServer((req, res) => {
+  try { handle(req, res); } catch (e) { console.error('request error: ' + e.message); try { if (!res.headersSent) res.writeHead(500); res.end('error'); } catch (e2) {} }
 });
+server.requestTimeout = 15000; server.headersTimeout = 10000;
 
 async function startup() {
   if (LIVE_ON) {
@@ -276,7 +301,7 @@ async function startup() {
     if (!LCFG.confirmed) fail('set LIVE_CONFIRM=I_UNDERSTAND_THIS_USES_REAL_MONEY to confirm.');
     try { require.resolve('viem'); } catch (e) { fail('run "npm install viem" first.'); }
     const pk = wallet.privateKey;
-    L = createLive({ privateKey: pk, address: wallet.address, cfg: LCFG, log });
+    L = createLive({ privateKey: pk, address: wallet.address, cfg: { ...LCFG, stopFile: STOP_FILE }, log });
     let pre;
     try { pre = await L.preflight(); } catch (e) { fail(e.message); }
     const usdc = await L.usdcBalance();
@@ -302,5 +327,7 @@ async function shutdown(sig) {
   try { save(); } catch (e) {}
   server.close(); process.exit(ticking ? 1 : 0);
 }
+process.on('unhandledRejection', (e) => console.error('unhandled rejection: ' + (e && e.message || e)));
+process.on('uncaughtException', (e) => { console.error('uncaught exception: ' + (e && e.stack || e)); process.exit(1); }); // Railway restarts us; state is saved after every fill
 process.on('SIGTERM', () => shutdown('SIGTERM')); process.on('SIGINT', () => shutdown('SIGINT'));
 startup();
