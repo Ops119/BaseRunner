@@ -262,14 +262,20 @@ const fails = new Map();
 const clientIp = (req) => String(req.headers['x-forwarded-for'] || '').split(',').pop().trim() || req.socket.remoteAddress || '?';
 const blocked = (ip) => { const f = fails.get(ip); return !!f && f.n >= 10 && now() - f.t < 300e3; };
 const noteFail = (ip) => { const f = fails.get(ip); if (!f || now() - f.t >= 300e3) fails.set(ip, { n: 1, t: now() }); else f.n++; if (fails.size > 1000) fails.clear(); };
-const LOGIN_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BaseRunner</title>
-<style>:root{color-scheme:dark}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#07080a;color:#e6e9ef;font:16px system-ui,sans-serif}
-form{width:min(340px,86vw);background:#111317;border:1px solid #242933;border-radius:14px;padding:26px}h1{margin:0 0 4px;font-size:20px;letter-spacing:.08em}
-h1 b{color:#39ff14}p{margin:0 0 18px;color:#7b8494;font-size:13px}input{width:100%;box-sizing:border-box;padding:12px;border-radius:9px;border:1px solid #242933;background:#07080a;color:#e6e9ef;font-size:16px}
-input:focus{outline:none;border-color:#3b82ff}button{width:100%;margin-top:12px;padding:12px;border:0;border-radius:9px;background:#3b82ff;color:#fff;font-size:16px;font-weight:600}
-#e{color:#ff5d73;font-size:13px;min-height:18px;margin-top:10px}</style></head><body>
-<form id="f"><h1>BASE<b>RUNNER</b></h1><p>Enter your dashboard key</p>
-<input id="k" type="password" autocomplete="current-password" placeholder="Dashboard key" autofocus required><button type="submit">Open dashboard</button><div id="e"></div></form>
+const LOGIN_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BASE//AGENT</title>
+<style>:root{color-scheme:dark;--bg:#07080a;--panel:#111317;--line:#242933;--text:#e6e9ef;--mute:#7b8494;--blue:#3b82ff;--blue2:#6aa5ff;--neon:#39ff14;--neg:#ff5d73;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+*{box-sizing:border-box;margin:0}body{min-height:100vh;display:grid;place-items:center;padding:14px;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif;
+background-image:radial-gradient(900px 400px at 80% -10%,#3b82ff14,transparent),radial-gradient(700px 300px at 0% 0%,#39ff1410,transparent)}
+form{width:min(360px,100%);background:linear-gradient(135deg,#111317,#10192b);border:1px solid #3b82ff44;border-radius:12px;padding:22px}
+h1{font:700 18px var(--mono);letter-spacing:.12em}h1 b{color:var(--neon)}
+h2{font:600 11px var(--mono);letter-spacing:.14em;color:var(--mute);text-transform:uppercase;margin:16px 0 8px}
+input{width:100%;padding:12px;border-radius:9px;border:1px solid var(--line);background:var(--bg);color:var(--blue2);font:16px var(--mono)}
+input::placeholder{color:var(--mute)}input:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px #3b82ff22}
+button{width:100%;margin-top:12px;padding:12px;border:1px solid var(--neon);border-radius:99px;background:#39ff1422;color:var(--neon);font:600 12px var(--mono);letter-spacing:.1em;cursor:pointer}
+button:active{background:#39ff1444;box-shadow:0 0 12px #39ff1466}
+#e{color:var(--neg);font:12px var(--mono);min-height:18px;margin-top:10px}.foot{margin-top:14px;color:var(--mute);font:11px var(--mono)}</style></head><body>
+<form id="f"><h1>BASE<b>//</b>AGENT</h1><h2>Dashboard key</h2>
+<input id="k" type="password" autocomplete="current-password" placeholder="Enter key" autofocus required><button type="submit">OPEN DASHBOARD</button><div id="e"></div><div class="foot">Private dashboard</div></form>
 <script>document.getElementById('f').onsubmit=async function(ev){ev.preventDefault();var e=document.getElementById('e');e.textContent='';
 try{var r=await fetch('/login',{method:'POST',headers:{'x-agent':'1','content-type':'application/json'},body:JSON.stringify({key:document.getElementById('k').value})});
 if(r.ok)location.reload();else e.textContent=r.status===429?'Too many tries. Wait 5 minutes.':'Wrong key.'}catch(x){e.textContent='Could not reach the server.'}}</script></body></html>`;
