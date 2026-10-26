@@ -262,6 +262,17 @@ const fails = new Map();
 const clientIp = (req) => String(req.headers['x-forwarded-for'] || '').split(',').pop().trim() || req.socket.remoteAddress || '?';
 const blocked = (ip) => { const f = fails.get(ip); return !!f && f.n >= 10 && now() - f.t < 300e3; };
 const noteFail = (ip) => { const f = fails.get(ip); if (!f || now() - f.t >= 300e3) fails.set(ip, { n: 1, t: now() }); else f.n++; if (fails.size > 1000) fails.clear(); };
+const LOGIN_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BaseRunner</title>
+<style>:root{color-scheme:dark}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#07080a;color:#e6e9ef;font:16px system-ui,sans-serif}
+form{width:min(340px,86vw);background:#111317;border:1px solid #242933;border-radius:14px;padding:26px}h1{margin:0 0 4px;font-size:20px;letter-spacing:.08em}
+h1 b{color:#39ff14}p{margin:0 0 18px;color:#7b8494;font-size:13px}input{width:100%;box-sizing:border-box;padding:12px;border-radius:9px;border:1px solid #242933;background:#07080a;color:#e6e9ef;font-size:16px}
+input:focus{outline:none;border-color:#3b82ff}button{width:100%;margin-top:12px;padding:12px;border:0;border-radius:9px;background:#3b82ff;color:#fff;font-size:16px;font-weight:600}
+#e{color:#ff5d73;font-size:13px;min-height:18px;margin-top:10px}</style></head><body>
+<form id="f"><h1>BASE<b>RUNNER</b></h1><p>Enter your dashboard key</p>
+<input id="k" type="password" autocomplete="current-password" placeholder="Dashboard key" autofocus required><button type="submit">Open dashboard</button><div id="e"></div></form>
+<script>document.getElementById('f').onsubmit=async function(ev){ev.preventDefault();var e=document.getElementById('e');e.textContent='';
+try{var r=await fetch('/login',{method:'POST',headers:{'x-agent':'1','content-type':'application/json'},body:JSON.stringify({key:document.getElementById('k').value})});
+if(r.ok)location.reload();else e.textContent=r.status===429?'Too many tries. Wait 5 minutes.':'Wrong key.'}catch(x){e.textContent='Could not reach the server.'}}</script></body></html>`;
 let lastTickOk = 0, shuttingDown = false;
 function handle(req, res) {
   for (const [k, v] of Object.entries(SEC_HEADERS)) res.setHeader(k, v);
@@ -270,6 +281,20 @@ function handle(req, res) {
     res.writeHead(shuttingDown ? 503 : 200, { 'content-type': 'application/json' });
     return res.end(JSON.stringify({ ok: !shuttingDown, mode: CFG.mode, lastTickAgeSec: age }));
   }
+  if (DASH_TOKEN && req.method === 'POST' && req.url === '/login') { // sign-in form: checks the key, sets the cookie
+    const ip = clientIp(req);
+    if (req.headers['x-agent'] !== '1') { res.writeHead(403); return res.end('forbidden'); }
+    if (blocked(ip)) { res.writeHead(429, { 'retry-after': '300' }); return res.end('too many attempts'); }
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 2000) req.destroy(); });
+    req.on('end', () => {
+      let key = ''; try { key = String(JSON.parse(body).key || ''); } catch (e) {}
+      if (!key || !safeEq(key, DASH_TOKEN)) { noteFail(ip); res.writeHead(401); return res.end('wrong key'); }
+      const secure = req.headers['x-forwarded-proto'] === 'https' ? ' Secure;' : '';
+      res.writeHead(200, { 'set-cookie': `agent_auth=${COOKIE_VAL}; HttpOnly;${secure} SameSite=Strict; Path=/; Max-Age=2592000` }); res.end('ok');
+    });
+    return;
+  }
   if (DASH_TOKEN) { // everything else needs the token (Bearer header, cookie, or one-time ?token= which sets a cookie)
     const ip = clientIp(req);
     if (blocked(ip)) { res.writeHead(429, { 'content-type': 'text/plain', 'retry-after': '300' }); return res.end('too many attempts'); }
@@ -277,7 +302,11 @@ function handle(req, res) {
     let ck = ''; try { ck = decodeURIComponent(cookieOf(req, 'agent_auth')); } catch (e) {}
     const bearer = (req.headers.authorization || '').replace(/^Bearer /, '');
     const okAuth = (bearer && safeEq(bearer, DASH_TOKEN)) || (q && safeEq(q, DASH_TOKEN)) || (ck && safeEq(ck, COOKIE_VAL));
-    if (!okAuth) { noteFail(ip); res.writeHead(401, { 'content-type': 'text/plain' }); return res.end('unauthorized: open the dashboard once with ?token=YOUR_DASH_TOKEN'); }
+    if (!okAuth) {
+      if (q || bearer || ck) noteFail(ip); // a wrong credential counts toward the lockout; a bare visit does not
+      if (req.method === 'GET' && !u.pathname.startsWith('/api/')) { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); return res.end(LOGIN_HTML); } // show the sign-in form
+      noteFail(ip); res.writeHead(401, { 'content-type': 'text/plain' }); return res.end('unauthorized');
+    }
     if (q && req.method === 'GET' && !u.pathname.startsWith('/api/')) {
       const secure = req.headers['x-forwarded-proto'] === 'https' ? ' Secure;' : ''; // plain-http localhost still works
       res.writeHead(302, { 'set-cookie': `agent_auth=${COOKIE_VAL}; HttpOnly;${secure} SameSite=Strict; Path=/; Max-Age=2592000`, location: u.pathname }); return res.end();
