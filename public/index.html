@@ -91,7 +91,7 @@ canvas{width:100%;height:170px;display:block}
 
 <div class="card" style="margin-bottom:12px" id="scancard" hidden>
   <h2><span>New Base coins · under <span id="scmax">$20k</span> MC</span><span id="scupd"></span></h2>
-  <div class="scn">Screened, <b>paper only</b>. Brand-new tiny tokens are where most rug pulls live: the agent never buys these with real money.</div>
+  <div class="scn">Screened. Paper sleeve always; a tiny <b>live</b> sleeve only if you enabled it. Brand-new tiny tokens are where most rug pulls live and any of them can go to zero.</div>
   <div class="scroll"><table id="sc"><thead><tr><th>Token</th><th>MC</th><th>Liq</th></tr></thead><tbody></tbody></table></div>
   <div class="empty" id="scempty">Nothing has passed every safety check yet. That is normal: most new tokens fail.</div>
   <div class="row" id="scsleeve" style="margin-top:10px"></div>
@@ -156,6 +156,7 @@ function render(s){
     $('sc').tBodies[0].innerHTML=sc.candidates.map(c=>`<tr><td class="sym">${c.sym.replace(/</g,'&lt;')}<small>${c.token.slice(0,6)}…${c.token.slice(-4)} · ${c.ageMin<120?c.ageMin+'m':Math.round(c.ageMin/60)+'h'}${c.usedFdv?' · FDV':''}</small><span class="sig ${c.confirmed?'on':''}" style="margin-top:4px;display:inline-block">${c.confirmed?'PASSED':'CHECK '+c.passes+'/2'}</span>${c.warn.map(w=>`<span class="chip w">${w.replace(/</g,'&lt;')}</span>`).join('')}</td><td>${k(c.mc)}</td><td>${k(c.liq)}</td></tr>`).join('');
     $('sc').hidden=!sc.candidates.length;$('scempty').hidden=sc.candidates.length>0;
     const z=sc.sleeve;$('scsleeve').innerHTML=`<span>Paper sleeve <b class="${cls(z.pnl)}">${usd(z.equity)}</b> of ${usd(z.budget,0)}</span><span>${z.open.length} open${z.open.map(o=>' · '+o.sym+' '+pct(o.pnlPct)).join('')}</span>${z.halted?'<span class="neg">HALTED</span>':''}`;
+    if(sc.live&&sc.live.enabled){const v=sc.live;$('scsleeve').innerHTML+=`<span style="color:var(--neon)">● LIVE sleeve ${usd(v.avail)} left of ${usd(v.budget,0)} · P&amp;L <b class="${cls(v.realized)}">${usd(v.realized)}</b></span><span>${v.open.length} open${v.open.map(o=>' · '+o.sym.replace(/</g,'&lt;')+' '+pct(o.pnlPct)+(o.stuck?' STUCK':'')).join('')}</span>${v.halted?'<span class="neg">LIVE HALTED: '+v.haltWhy.replace(/</g,'&lt;')+'</span>':''}`}
     $('screj').textContent=sc.rejects.length?'Just rejected: '+sc.rejects.map(r=>r.sym+' ('+r.why[0]+')').join(' · '):'';
   }
   $('trempty').hidden=s.trades.length>0;$('tr').hidden=!s.trades.length;

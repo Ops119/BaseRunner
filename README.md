@@ -72,7 +72,7 @@ Railway notes: a service with a volume runs one replica and a redeploy has a sho
 ## New-coin scanner (under $20k market cap)
 `scanner.js` watches new Base pools (GeckoTerminal) and screens them with GoPlus contract data. Both are free and need no key. It runs every 5 minutes and shows survivors in a dashboard card.
 
-**It is paper-only by design.** It never touches the wallet, and there is no setting that makes it trade live. Tokens this small are mostly scams or illiquid, and a screen cannot make them safe. A passing token can still rug.
+**By default it is paper-only** and never touches the wallet. A live mode exists (below) but needs several separate opt-ins. Tokens this small are mostly scams or illiquid, and a screen cannot make them safe: a passing token can still rug.
 
 Every token must pass all of these, and anything unknown counts as a fail:
 - **Market:** pair quoted in WETH or USDC; market cap (or FDV when unverified) between $3k and $20k; liquidity of at least $3k; age 15 min to 48 h; at least 8 buyers and real sells in the last hour; not already up 150% in an hour.
@@ -83,6 +83,20 @@ Every token must pass all of these, and anything unknown counts as a fail:
 The paper sleeve has a $30 budget, $10 per position, 3 positions at most. Fills are pessimistic (price impact, 3% extra buy slippage, 5% extra sell slippage, 1% pool fee). Exits: stop -30%, take-profit +100%, trailing stop, 12 h time stop, or immediately if liquidity falls by half. It halts itself if it loses half its budget and won't re-enter a token for 24 h after selling it.
 
 Limits: GeckoTerminal only lists the newest pools, so fast launches can be missed, and free-tier data can lag or rate-limit (the scanner backs off for 5 minutes). Tune with `SCAN_MAX_MC`, `SCAN_MIN_LIQ`, `SCAN_BUDGET_USD`, `SCAN_TRADE_USD`, or turn it off with `SCAN=off`.
+
+### Live scanner trading (optional, off by default)
+The scanner can put a tiny amount of real money into coins that pass every screen. It needs **all** of: `LIVE=1` with its own confirmation, `SCAN_LIVE=1`, and `SCAN_LIVE_CONFIRM=I_ACCEPT_SCANNER_COINS_CAN_GO_TO_ZERO`. If any is missing it stays paper-only. Fund the wallet with the scanner budget on top of the main bankroll, plus ETH for gas (these swaps are not gasless).
+
+Extra safeguards on the live sleeve:
+- **Budget:** $20 total (`SCAN_LIVE_BUDGET_USD`), $5 per trade (`SCAN_LIVE_TRADE_USD`), at most 2 open, never more than 2% of the pool's liquidity.
+- **Fresh checks before every buy:** the pool and GoPlus contract data are fetched again, the price must be within 10% of the screened price, and the token's address, code, symbol and decimals are verified on-chain.
+- **Proven exit:** a sell quote for your size must return at least 70% of what you put in, or nothing is bought. Right after the buy, the sell quote is checked again; if it fails, the position is sold immediately.
+- **Routing:** direct aggregators only (Velora, then KyberSwap), with a price guard on every swap, exact token approvals, and a dry-run before sending.
+- **Fast exits:** open positions are checked every 60 seconds (`SCAN_LIVE_MONITOR_SEC`) for the stop, take-profit, trailing stop, 12 h limit, or liquidity pulled. A failed exit keeps retrying and is flagged STUCK on the dashboard after 3 failures.
+- **Circuit breakers:** halts new entries after 2 failed trades in a row or after losing half the budget. The `STOP` kill switch also blocks scanner buys.
+- Swaps are serialised with the main agent so they can't collide.
+
+What it cannot protect against: a token that passes every check and still rugs or freezes (the screens reduce this, they don't remove it), price manipulation around your trade, and thin markets where your sell moves the price. Assume you can lose the whole scanner budget.
 
 ## Security notes
 - Dashboard: `DASH_TOKEN` (16+ characters) is required whenever the agent listens on a public address. Wrong tokens are locked out after 10 tries per 5 minutes, the login cookie stores a hash rather than the token, and responses carry a strict CSP and anti-framing headers. The `?token=` link puts the token in the URL once, so open it only on devices you trust and don't share screenshots of the address bar.

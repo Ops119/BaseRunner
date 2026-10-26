@@ -23,6 +23,16 @@ function scanConfig(env = process.env) {
     budget: +env.SCAN_BUDGET_USD || 30, perTrade: +env.SCAN_TRADE_USD || 10, maxOpen: 3,
     stop: -0.30, takeProfit: 1.0, trailArm: 0.5, trailDrop: 0.25, timeHr: 12, rugLiqDrop: 0.5,
     poolFee: 0.01, extraBuySlip: 0.03, extraSellSlip: 0.05,   // deliberately pessimistic fills
+    // LIVE sleeve (real money). Only used when the agent hands in an executor, which needs two separate opt-ins (see README).
+    live: {
+      budget: +env.SCAN_LIVE_BUDGET_USD || 20, perTrade: +env.SCAN_LIVE_TRADE_USD || 5, maxOpen: 2,
+      maxLiqPct: 0.02,            // never put in more than 2% of the pool's liquidity (keeps our own price impact small)
+      maxRoundTripLoss: 0.30,     // a sell quote for our size must return at least 70% of what we put in, or we don't buy
+      maxPriceDrift: 0.10,        // fresh price must be within 10% of the screened price
+      maxFails: 2,                // consecutive failed trades before the live sleeve halts
+      lossHalt: 0.5,              // halt entries after losing half the budget
+      buyDev: 0.15, exitDev: 0.40, bps: 1000, monitorSec: +env.SCAN_LIVE_MONITOR_SEC || 60,
+    },
     gecko: env.GECKO_URL || 'https://api.geckoterminal.com/api/v2/networks/base',
     goplus: env.GOPLUS_URL || 'https://api.gopluslabs.io/api/v1/token_security/8453',
   };
@@ -121,12 +131,14 @@ function scoreOf(p, warn) {
 }
 
 // ---------- scanner ----------
-function createScanner({ dir, log, fetchFn = (...a) => fetch(...a), now = () => Date.now(), cfg = scanConfig() }) {
+function createScanner({ dir, log, fetchFn = (...a) => fetch(...a), now = () => Date.now(), cfg = scanConfig(), exec = null }) {
   const file = path.join(dir, 'scan-state.json');
   let st;
   try { st = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { st = null; }
   st = Object.assign({ pending: {}, seen: {}, rejected: {}, candidates: [], recentRejects: [], sleeve: null, lastScan: 0, lastError: null, scans: 0 }, st || {});
   if (!st.sleeve) st.sleeve = { cash: cfg.budget, budget: cfg.budget, positions: {}, closed: [], halted: false };
+  if (!st.live) st.live = { budget: cfg.live.budget, realized: 0, positions: {}, closed: [], halted: false, haltWhy: '', fails: 0 };
+  for (const p of Object.values(st.live.positions)) p.selling = false;
   const save = () => { const t = file + '.tmp'; fs.writeFileSync(t, JSON.stringify(st)); fs.renameSync(t, file); };
   let busy = false, timer = null, backoffUntil = 0;
 
@@ -201,6 +213,112 @@ function createScanner({ dir, log, fetchFn = (...a) => fetch(...a), now = () => 
     log(`Scanner sleeve (paper): bought $${usd.toFixed(2)} of ${c.sym} at MC $${Math.round(c.mc)}, liquidity $${Math.round(c.liq)} (screens passed ${c.passes}x)`, 'buy');
   }
 
+  // ----- LIVE sleeve (real money) -----
+  const L = st.live, LC = cfg.live;
+  const keyOf = (token) => 'S' + token.slice(-10).toUpperCase();   // unique per token in practice; collisions are checked below
+  const liveOpenCost = () => Object.values(L.positions).reduce((a, p) => a + p.usd, 0);
+  const liveAvail = () => L.budget + L.realized - liveOpenCost();
+  const haltLive = (why) => { if (!L.halted) { L.halted = true; L.haltWhy = why; log(`Scanner LIVE sleeve halted: ${why}. Open positions are still managed.`, 'risk'); } };
+  const execOpts = () => ({ dev: LC.exitDev, bps: LC.bps, routers: exec.routers });
+
+  async function liveSell(key, p, price, why) {
+    if (p.selling) return;
+    p.selling = true;
+    try {
+      const r = await exec.sell(p.key, p.qty, price, execOpts());
+      if (!r) {
+        p.sellFails = (p.sellFails || 0) + 1; p.retry = why;
+        if (p.sellFails >= 3 && !p.stuck) { p.stuck = true; log(`Scanner LIVE: cannot sell ${p.sym} after ${p.sellFails} tries (${why}). It may be a honeypot or have no liquidity. It stays in the wallet; retrying each minute.`, 'risk'); }
+        return;
+      }
+      const pnl = r.usd - p.usd; L.realized += pnl; delete L.positions[key];
+      L.closed.unshift({ t: now(), sym: p.sym, token: p.token, usd: p.usd, net: r.usd, pnlPct: (r.usd / p.usd - 1) * 100, why, hash: r.hash });
+      L.closed = L.closed.slice(0, 40);
+      try { exec.forget(p.key); } catch (e) {}
+      log(`Scanner LIVE: sold ${p.sym} (${why}) ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} via ${r.router}`, pnl >= 0 ? 'win' : 'loss');
+      if (L.realized <= -L.budget * LC.lossHalt) haltLive(`lost ${Math.round(-L.realized / L.budget * 100)}% of its budget`);
+      L.fails = 0;
+    } finally { p.selling = false; try { save(); } catch (e) {} }
+  }
+
+  async function manageLive(marks) {
+    for (const [key, p] of Object.entries(L.positions)) {
+      const m = marks[p.pool];
+      if (!m || m.price == null) { p.missing = (p.missing || 0) + 1; if (p.missing === 3) log(`Scanner LIVE: no data for ${p.sym}'s pool for 3 checks. Position unchanged; watch it.`, 'risk'); continue; }
+      p.missing = 0; p.last = m.price; p.peak = Math.max(p.peak, m.price);
+      const ret = m.price / p.entry - 1, age = (now() - p.openedAt) / 3600e3;
+      let why = null;
+      if (p.retry) why = p.retry;                                   // a failed exit keeps retrying with its original reason, even if price recovers
+      else if (m.liq != null && m.liq < p.liq0 * (1 - cfg.rugLiqDrop)) why = 'liquidity pulled';
+      else if (ret <= cfg.stop) why = 'stop-loss';
+      else if (ret >= cfg.takeProfit) why = 'take-profit';
+      else if (p.peak / p.entry - 1 >= cfg.trailArm && m.price / p.peak - 1 <= -cfg.trailDrop) why = 'trailing stop';
+      else if (age >= cfg.timeHr) why = 'time stop';
+      if (why) await liveSell(key, p, m.price, why);
+    }
+  }
+
+  // Fast loop for open live positions only: a rug does not wait for the 5-minute scan.
+  async function monitorLive() {
+    if (!exec || monitorBusy || now() < backoffUntil) return;
+    const pools = Object.values(L.positions).map((p) => p.pool);
+    if (!pools.length) return;
+    monitorBusy = true;
+    try { const data = {}; for (const p of await refreshPools(pools)) data[p.pool] = p; await manageLive(data); }
+    catch (e) { log('Scanner LIVE monitor: ' + e.message, 'risk'); }
+    finally { monitorBusy = false; try { save(); } catch (e) {} }
+  }
+  let monitorBusy = false, monitorTimer = null;
+
+  async function maybeEnterLive(cands) {
+    if (!exec) return;
+    if (L.halted || Object.keys(L.positions).length >= LC.maxOpen) return;
+    const recent = new Set(L.closed.filter((x) => now() - x.t < 24 * 3600e3).map((x) => x.token));
+    const c = cands.find((x) => x.confirmed && !L.positions[x.token] && !recent.has(x.token));
+    if (!c) return;
+    const skip = (why) => { log(`Scanner LIVE: skipped ${c.sym}: ${why}`, 'info'); return false; };
+    // 1) fresh market + contract data right before money moves
+    let fresh;
+    try { [fresh] = await refreshPools([c.pool]); } catch (e) { return skip('could not refresh pool data'); }
+    if (!fresh) return skip('pool no longer listed');
+    const mk = screenMarket(fresh, cfg, now());
+    if (mk.length) return skip(mk[0]);
+    if (Math.abs(fresh.price / c.price - 1) > LC.maxPriceDrift) return skip('price moved more than ' + LC.maxPriceDrift * 100 + '% since screening');
+    let sec;
+    try { sec = screenSecurity(await securityOf(c.token), fresh, cfg); } catch (e) { return skip('fresh security check unavailable'); }
+    if (sec.why.length) { st.rejected[c.token] = { t: now(), hard: true, why: sec.why }; return skip(sec.why[0]); }
+    // 2) size: budget, wallet balance, and a fraction of pool liquidity
+    const size = Math.min(LC.perTrade, liveAvail(), fresh.liq * LC.maxLiqPct);
+    if (size < 2) return skip(`size $${size.toFixed(2)} too small (budget left or pool too thin)`);
+    let bal; try { bal = await exec.usdc(); } catch (e) { return skip('cannot read wallet balance'); }
+    if (bal < size + 1) return skip(`wallet has $${bal.toFixed(2)} USDC`);
+    // 3) on-chain checks of the token itself, and proof that a sell route exists for our size
+    const key = keyOf(c.token);
+    if (Object.values(L.positions).some((p) => p.key === key)) return skip('internal key collision');
+    try { await exec.register(key, c.token, c.sym); } catch (e) { st.rejected[c.token] = { t: now(), hard: true, why: [e.message] }; return skip('on-chain check failed: ' + e.message); }
+    const out = await exec.probeSell(key, size / fresh.price);
+    if (out == null || out < size * (1 - LC.maxRoundTripLoss)) { exec.forget(key); st.rejected[c.token] = { t: now(), hard: true, why: ['no good sell route'] }; return skip(out == null ? 'no sell route found' : `selling $${size.toFixed(2)} would only return $${out.toFixed(2)}`); }
+    // 4) buy
+    const r = await exec.buy(key, size, fresh.price, { dev: LC.buyDev, bps: LC.bps, routers: exec.routers });
+    if (!r) { exec.forget(key); L.fails++; if (L.fails >= LC.maxFails) haltLive(`${L.fails} failed trades in a row`); return false; }
+    L.fails = 0;
+    const p = L.positions[c.token] = { token: c.token, key, pool: c.pool, sym: c.sym, entry: r.px, qty: r.qty, usd: r.usd, openedAt: now(), peak: r.px, liq0: fresh.liq, last: fresh.price, hash: r.hash };
+    try { save(); } catch (e) {}
+    log(`Scanner LIVE: bought $${r.usd.toFixed(2)} of ${c.sym} at MC $${Math.round(c.mc)}, liquidity $${Math.round(fresh.liq)} via ${r.router}`, 'buy');
+    // 5) honeypot tripwire: right after buying, a sell quote for what we hold must still come back sane
+    const back = await exec.probeSell(key, r.qty);
+    if (back == null || back < r.usd * 0.5) { log(`Scanner LIVE: ${c.sym} failed the post-buy sell check (quote ${back == null ? 'none' : '$' + back.toFixed(2)}). Selling now.`, 'risk'); await liveSell(c.token, p, fresh.price, 'post-buy sell check failed'); }
+    return true;
+  }
+
+  async function restoreLive() {
+    if (!exec) return;
+    for (const p of Object.values(L.positions)) {
+      try { await exec.register(p.key, p.token, p.sym); }
+      catch (e) { p.stuck = true; log(`Scanner LIVE: could not re-register ${p.sym} after restart (${e.message}). Check the wallet manually.`, 'risk'); }
+    }
+  }
+
   async function scanOnce() {
     if (busy || now() < backoffUntil) return;
     busy = true;
@@ -219,6 +337,7 @@ function createScanner({ dir, log, fetchFn = (...a) => fetch(...a), now = () => 
       const data = {}; for (const p of [...fresh, ...refreshed]) data[p.pool] = p;
       // 3) manage the sleeve with fresh marks before looking for new entries
       manage(data, true);
+      await manageLive(data);
       // 4) screen
       const cands = [], rejects = [];
       let secCalls = 0;
@@ -258,6 +377,7 @@ function createScanner({ dir, log, fetchFn = (...a) => fetch(...a), now = () => 
       st.recentRejects = [...rejects, ...st.recentRejects].slice(0, 12);
       // 5) entry (paper sleeve)
       maybeEnter(cands, data);
+      await maybeEnterLive(cands);
       for (const k of Object.keys(st.rejected)) if (now() - st.rejected[k].t > 24 * 3600e3) delete st.rejected[k];
       const keep = Object.entries(st.pending).sort((a, b) => b[1].first - a[1].first).slice(0, 90);
       st.pending = Object.fromEntries(keep);
@@ -270,8 +390,13 @@ function createScanner({ dir, log, fetchFn = (...a) => fetch(...a), now = () => 
 
   return {
     scanOnce, cfg,
-    start() { if (!cfg.enabled) return; setTimeout(scanOnce, 5000); timer = setInterval(scanOnce, cfg.intervalSec * 1000); },
-    async stop() { clearInterval(timer); const t0 = now(); while (busy && now() - t0 < 20000) await sleep(200); },
+    async start() {
+      if (!cfg.enabled) return;
+      await restoreLive();
+      setTimeout(scanOnce, 5000); timer = setInterval(scanOnce, cfg.intervalSec * 1000);
+      if (exec) monitorTimer = setInterval(monitorLive, LC.monitorSec * 1000);
+    },
+    async stop() { clearInterval(timer); clearInterval(monitorTimer); const t0 = now(); while ((busy || monitorBusy) && now() - t0 < 60000) await sleep(200); },
     api() {
       const s = st.sleeve, marks = {};
       for (const p of Object.values(s.positions)) marks[p.pool] = { price: p.last };
@@ -280,6 +405,8 @@ function createScanner({ dir, log, fetchFn = (...a) => fetch(...a), now = () => 
         enabled: cfg.enabled, lastScan: st.lastScan, lastError: st.lastError, stats: st.lastStats || null,
         limits: { maxMc: cfg.maxMc, minLiq: cfg.minLiq, minLpLocked: Math.round(cfg.minLpLocked * 100), maxTax: Math.round(cfg.maxTax * 100) },
         candidates: st.candidates, rejects: st.recentRejects.slice(0, 6),
+        live: exec ? { enabled: true, budget: L.budget, avail: liveAvail(), realized: L.realized, halted: L.halted, haltWhy: L.haltWhy, perTrade: LC.perTrade,
+          open: Object.values(L.positions).map((p) => ({ sym: p.sym, usd: p.usd, pnlPct: ((p.last || p.entry) / p.entry - 1) * 100, stuck: !!p.stuck })), closed: L.closed.slice(0, 6) } : { enabled: false },
         sleeve: { budget: s.budget, equity: eq, pnl: eq - s.budget, halted: s.halted, perTrade: cfg.perTrade,
           open: Object.values(s.positions).map((p) => ({ sym: p.sym, usd: p.usd, pnlPct: ((p.last || p.entry) * (1 - p.exitHaircut) / p.entry - 1) * 100, ageH: (now() - p.openedAt) / 3600e3 })),
           closed: s.closed.slice(0, 6) },

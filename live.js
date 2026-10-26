@@ -124,7 +124,11 @@ function createLive({ privateKey, address, cfg, log, viemLib }) {
   const pub = createPublicClient({ chain: base, transport: http(cfg.rpc) });
   const wal = createWalletClient({ account, chain: base, transport: http(cfg.rpc) });
   const ok = {}; // sym -> { decimals }
+  const T = { ...TOKENS }; // static watchlist + tokens registered at runtime by the scanner
   let fails = 0;
+  // Every swap goes through one queue: two swaps at once would race on nonces and on the USDC allowance.
+  let chain = Promise.resolve();
+  const locked = (fn) => { const run = chain.then(fn, fn); chain = run.catch(() => {}); return run; };
   const stopFile = cfg.stopFile || path.join(__dirname, 'STOP'); // must be the same file the dashboard kill switch writes
 
   const bal = (addr) => pub.readContract({ address: addr, abi: ERC20, functionName: 'balanceOf', args: [account.address] });
@@ -214,10 +218,10 @@ function createLive({ privateKey, address, cfg, log, viemLib }) {
 
   // Tries each router in priority order. Falls over to the next one on any problem BEFORE a swap is broadcast
   // (API down, no route, bad price, wrong router address, dry-run revert). Once a swap tx is sent, no fallback: it either confirms or the trade fails.
-  async function swap(sellToken, buyToken, sellAmount, sellDec, buyDec, bps, minOutHuman) {
+  async function swap(sellToken, buyToken, sellAmount, sellDec, buyDec, bps, minOutHuman, routers = cfg.routers) {
     const errs = [];
-    for (let i = 0; i < cfg.routers.length; i++) {
-      const name = cfg.routers[i];
+    for (let i = 0; i < routers.length; i++) {
+      const name = routers[i];
       if (name === 'delta') {
         try {
           const r = await deltaSwap(sellToken, buyToken, sellAmount, sellDec, buyDec, bps, minOutHuman);
@@ -226,7 +230,7 @@ function createLive({ privateKey, address, cfg, log, viemLib }) {
         } catch (e) {
           if (e.noFallback) throw e;
           errs.push(`delta: ${e.shortMessage || e.message}`);
-          log(`Live: delta unusable (${e.shortMessage || e.message})${i < cfg.routers.length - 1 ? '; trying next' : ''}`, 'risk');
+          log(`Live: delta unusable (${e.shortMessage || e.message})${i < routers.length - 1 ? '; trying next' : ''}`, 'risk');
           continue;
         }
       }
@@ -247,7 +251,7 @@ function createLive({ privateKey, address, cfg, log, viemLib }) {
         await pub.call(call); // dry-run: throws if it would revert
       } catch (e) {
         errs.push(`${name}: ${e.shortMessage || e.message}`);
-        log(`Live: ${name} unusable (${e.shortMessage || e.message})${i < cfg.routers.length - 1 ? '; trying backup' : ''}`, 'risk');
+        log(`Live: ${name} unusable (${e.shortMessage || e.message})${i < routers.length - 1 ? '; trying backup' : ''}`, 'risk');
         continue;
       }
       const gas = q.gas ? (q.gas * 12n) / 10n : undefined;
@@ -265,8 +269,50 @@ function createLive({ privateKey, address, cfg, log, viemLib }) {
 
   return {
     preflight, stopped,
+    // Serialised entry points (the *_ implementations above are not meant to be called directly).
+    buy(...a) { return locked(() => this._buy(...a)); },
+    sell(...a) { return locked(() => this._sell(...a)); },
+
+    // Scanner support: tokens discovered at runtime. Only registered after on-chain checks; never touches TOKENS.
+    async registerToken(key, addr, symHint) {
+      const a = getAddress(addr);
+      if (same(a, USDC) || same(a, WETH)) throw new Error('refusing to register USDC/WETH as a scanner token');
+      const code = await (pub.getCode ? pub.getCode({ address: a }) : pub.getBytecode({ address: a }));
+      if (!code || code === '0x') throw new Error('no contract code at address');
+      const [s, d] = await Promise.all([
+        pub.readContract({ address: a, abi: ERC20, functionName: 'symbol' }),
+        pub.readContract({ address: a, abi: ERC20, functionName: 'decimals' }),
+      ]);
+      if (Number(d) < 0 || Number(d) > 18) throw new Error('unusual decimals ' + d);
+      const norm = (x) => String(x).toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (symHint && norm(s) !== norm(symHint)) throw new Error(`symbol mismatch: chain says "${s}", listing says "${symHint}"`);
+      T[key] = { addr: a, symbol: s, dev: 0.15, bps: 1000, size: 1.0 };
+      ok[key] = { decimals: Number(d) };
+      return { symbol: s, decimals: Number(d) };
+    },
+    forgetToken(key) { if (!TOKENS[key]) { delete T[key]; delete ok[key]; } },
+    // How much USDC would selling `human` tokens return right now? Quote only, nothing is sent. null = no route.
+    async probeSell(key, human) {
+      const t = T[key], d = ok[key] && ok[key].decimals;
+      if (!t || d == null) return null;
+      const amt = BigInt(Math.floor(human * 10 ** d));
+      if (amt <= 0n) return null;
+      try {
+        const q = new URLSearchParams({ srcToken: t.addr, destToken: USDC, amount: amt.toString(), srcDecimals: String(d), destDecimals: '6', side: 'SELL', network: '8453', version: '6.2' });
+        const pr = (await getJson(`${cfg.veloraBase}/prices?${q}`)).priceRoute;
+        if (pr && pr.destAmount && (!pr.contractAddress || same(pr.contractAddress, AUGUSTUS_V62))) return Number(BigInt(pr.destAmount)) / 1e6;
+      } catch (e) { /* try the other aggregator */ }
+      try {
+        const base = cfg.kyberKey ? 'https://api.kyberswap.com/swap/base/api/v1' : `${cfg.kyberBase}/base/api/v1`;
+        const h = { 'X-Client-Id': 'base-agent', ...(cfg.kyberKey ? { 'X-Api-Key': cfg.kyberKey } : {}) };
+        const r = await getJson(`${base}/routes?${new URLSearchParams({ tokenIn: t.addr, tokenOut: USDC, amountIn: amt.toString() })}`, { headers: h });
+        const out = r.data && r.data.routeSummary && r.data.routeSummary.amountOut;
+        if (out) return Number(BigInt(out)) / 1e6;
+      } catch (e) { /* no route */ }
+      return null;
+    },
     tradable: (sym) => !!ok[sym],
-    maxTradeUsd: (sym) => Math.min(cfg.maxTradeUsd, cfg.maxTradeUsd * TOKENS[sym].size),
+    maxTradeUsd: (sym) => Math.min(cfg.maxTradeUsd, cfg.maxTradeUsd * T[sym].size),
     halted: () => fails >= cfg.maxConsecutiveFails,
     usdcBalance: async () => Number(await bal(USDC)) / 1e6,
     ethBalance: async () => Number(await pub.getBalance({ address: account.address })) / 1e18,
@@ -274,8 +320,8 @@ function createLive({ privateKey, address, cfg, log, viemLib }) {
     // returns { px, qty, usd, hash } or null on failure.
     // On ANY error we re-read balances: if a fill actually landed (e.g. a gasless order that filled while we were
     // timing out), we record it instead of leaving untracked tokens in the wallet.
-    async buy(sym, usd, price) {
-      const t = TOKENS[sym], d = ok[sym].decimals;
+    async _buy(sym, usd, price, o = {}) {
+      const t = T[sym], d = ok[sym].decimals;
       if (stopped()) { log('Live: STOP file present, buy skipped', 'risk'); return null; }
       usd = Math.min(usd, this.maxTradeUsd(sym));
       let before, usdcBefore;
@@ -283,7 +329,7 @@ function createLive({ privateKey, address, cfg, log, viemLib }) {
         before = await bal(getAddress(t.addr)); usdcBefore = await bal(USDC);
         const sellAmount = BigInt(Math.floor(usd * 1e6));
         const expected = usd / price;
-        const { ref, router } = await swap(USDC, getAddress(t.addr), sellAmount, 6, d, t.bps, expected * (1 - t.dev));
+        const { ref, router } = await swap(USDC, getAddress(t.addr), sellAmount, 6, d, o.bps ?? t.bps, expected * (1 - (o.dev ?? t.dev)), o.routers);
         const got = Number((await bal(getAddress(t.addr))) - before) / 10 ** d;
         if (got <= 0) throw new Error('swap confirmed but token balance did not increase');
         fails = 0;
@@ -300,12 +346,12 @@ function createLive({ privateKey, address, cfg, log, viemLib }) {
             }
           }
         } catch (e2) { /* fall through to failure */ }
-        guardFail(e); return null;
+        if (!o.scanner) guardFail(e); else log(`Live (scanner): trade failed: ${e.message}`, 'risk'); return null;
       }
     },
 
-    async sell(sym, qtyWanted, price) {
-      const t = TOKENS[sym], d = ok[sym].decimals;
+    async _sell(sym, qtyWanted, price, o = {}) {
+      const t = T[sym], d = ok[sym].decimals;
       let usdcBefore, tokBefore, human;
       try {
         const have = await bal(getAddress(t.addr));
@@ -314,7 +360,7 @@ function createLive({ privateKey, address, cfg, log, viemLib }) {
         if (amt <= 0n) throw new Error('nothing to sell on-chain');
         human = Number(amt) / 10 ** d; tokBefore = have;
         usdcBefore = await bal(USDC);
-        const { ref, router } = await swap(getAddress(t.addr), USDC, amt, d, 6, t.bps, human * price * (1 - t.dev));
+        const { ref, router } = await swap(getAddress(t.addr), USDC, amt, d, 6, o.bps ?? t.bps, human * price * (1 - (o.dev ?? t.dev)), o.routers);
         const got = Number((await bal(USDC)) - usdcBefore) / 1e6;
         fails = 0;
         return { px: got / human, qty: human, usd: got, hash: ref, router };
@@ -329,7 +375,7 @@ function createLive({ privateKey, address, cfg, log, viemLib }) {
             }
           }
         } catch (e2) { /* fall through to failure */ }
-        guardFail(e); return null;
+        if (!o.scanner) guardFail(e); else log(`Live (scanner): trade failed: ${e.message}`, 'risk'); return null;
       }
     },
   };

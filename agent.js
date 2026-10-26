@@ -312,7 +312,21 @@ async function startup() {
     console.log(`\nDashboard: http://localhost:${CFG.port}\nWallet:    ${wallet.address} (Base)\nMode:      ${CFG.mode.toUpperCase()}${LIVE_ON ? `  (cap $${LCFG.maxTotalUsd} total, $${LCFG.maxTradeUsd} per trade; create a file named STOP to halt entries)` : ''}\n`);
     if (wallet.created) log('Agent wallet created. Private key stored in wallet.json (chmod 600). Back it up; never share it.');
     tick(); tickTimer = setInterval(tick, CFG.tickSeconds * 1000);
-    try { scanner = createScanner({ dir: DATA_DIR, log }); scanner.start(); } catch (e) { log('Scanner failed to start: ' + e.message, 'risk'); }
+    try {
+      // Scanner coins trade with real money only with BOTH opt-ins; otherwise the scanner stays paper-only.
+      let exec = null;
+      if (LIVE_ON && process.env.SCAN_LIVE === '1') {
+        if (process.env.SCAN_LIVE_CONFIRM === 'I_ACCEPT_SCANNER_COINS_CAN_GO_TO_ZERO') {
+          const routers = LCFG.routers.filter(r => r !== 'delta'); // gasless intents are for liquid majors; tiny tokens use the direct aggregators
+          exec = { routers: routers.length ? routers : ['velora', 'kyber'],
+            register: (k, addr, sym) => L.registerToken(k, addr, sym), forget: (k) => L.forgetToken(k), probeSell: (k, h) => L.probeSell(k, h), usdc: () => L.usdcBalance(),
+            buy: (k, usd, px, o) => L.buy(k, usd, px, { ...o, scanner: true }), sell: (k, q, px, o) => L.sell(k, q, px, { ...o, scanner: true }) };
+          log('Scanner LIVE sleeve ENABLED: real money, tiny caps. Scanner coins can go to zero.', 'risk');
+        } else log('SCAN_LIVE=1 ignored: also set SCAN_LIVE_CONFIRM=I_ACCEPT_SCANNER_COINS_CAN_GO_TO_ZERO. Scanner stays paper-only.', 'risk');
+      } else if (process.env.SCAN_LIVE === '1') log('SCAN_LIVE=1 ignored: it only works together with LIVE=1.', 'risk');
+      scanner = createScanner({ dir: DATA_DIR, log, exec });
+      scanner.start().catch((e) => log('Scanner failed to start: ' + e.message, 'risk'));
+    } catch (e) { log('Scanner failed to start: ' + e.message, 'risk'); }
   });
 }
 let tickTimer = null;
