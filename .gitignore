@@ -1,0 +1,8 @@
+wallet.json
+state*.json
+STOP
+node_modules
+.env
+scan-state.json
+*.tmp
+.DS_Store

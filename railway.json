@@ -1,0 +1,12 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": { "builder": "RAILPACK" },
+  "deploy": {
+    "startCommand": "node agent.js",
+    "healthcheckPath": "/health",
+    "healthcheckTimeout": 60,
+    "numReplicas": 1,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 5
+  }
+}
